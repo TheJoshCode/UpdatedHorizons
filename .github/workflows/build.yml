@@ -10,48 +10,41 @@ on:
 permissions:
   contents: read
 
-env:
-  # Single source of truth for the version list (space-separated).
-  MC_VERSIONS: "26.3.0 26.2.0 26.1.2 1.21.11 1.21.10 1.21.9 1.21.8 1.21.6 1.21.5 1.21.4 1.21.3 1.21.1 1.20.6 1.20.4 1.20.2 1.20.1 1.19.4 1.19.2 1.18.2 1.17.1 1.16.5 1.12.2 1.7.10"
-
 jobs:
+  matrix:
+    name: Discover MC versions
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.discover.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Discover versions from versionProperties
+        id: discover
+        run: |
+          versions=$(python3 -c '
+          import json, pathlib, re
+          vs = [p.stem for p in pathlib.Path("versionProperties").glob("*.properties")]
+          vs.sort(key=lambda v: tuple(int(x) if x.isdigit() else x for x in re.split(r"[.]", v)))
+          print(json.dumps(vs))
+          ')
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+          echo "Discovered: $versions"
+
   build:
     name: MC ${{ matrix.mc_ver }}
+    needs: matrix
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       # Maven Central rate-limits (HTTP 429) when all 23 jobs fetch deps at once.
       max-parallel: 3
       matrix:
-        mc_ver:
-          - "26.3.0"
-          - "26.2.0"
-          - "26.1.2"
-          - "1.21.11"
-          - "1.21.10"
-          - "1.21.9"
-          - "1.21.8"
-          - "1.21.6"
-          - "1.21.5"
-          - "1.21.4"
-          - "1.21.3"
-          - "1.21.1"
-          - "1.20.6"
-          - "1.20.4"
-          - "1.20.2"
-          - "1.20.1"
-          - "1.19.4"
-          - "1.19.2"
-          - "1.18.2"
-          - "1.17.1"
-          - "1.16.5"
-          - "1.12.2"
-          - "1.7.10"
+        mc_ver: ${{ fromJSON(needs.matrix.outputs.versions) }}
 
     steps:
       - name: Check MC version is in the authoritative list
         run: |
-          echo "$MC_VERSIONS" | tr ' ' '\n' | grep -qx "${{ matrix.mc_ver }}" || {
+          find versionProperties -name '${{ matrix.mc_ver }}.properties' | grep -q . || {
             echo "Matrix version ${{ matrix.mc_ver }} missing from MC_VERSIONS"; exit 1;
           }
 
@@ -154,7 +147,7 @@ jobs:
 
   release:
     name: Publish release with all jars
-    needs: build
+    needs: [build, matrix]
     if: needs.build.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
@@ -182,7 +175,7 @@ jobs:
           # Every matrix entry must appear in at least one released jar filename.
           # Upstream abbreviates 26.x.y to 26.x in jar names, so match that too.
           missing=0
-          for v in $MC_VERSIONS; do
+          for v in ${{ join(fromJSON(needs.matrix.outputs.versions), ' ') }}; do
             token="$v"
             case "$v" in 26.*.*) token=$(echo "$v" | cut -d. -f1,2) ;; esac
             if ! find final -name "*.jar" -type f | grep -q -- "-${token}[.-]"; then
@@ -194,7 +187,7 @@ jobs:
             echo "Refusing to publish: $missing version(s) missing jars"
             exit 1
           fi
-          echo "Verified: all $MC_VERSIONS have jars"
+          echo "Verified: all matrix versions have jars"
 
       - name: Remove stale nightly release assets
         if: github.event_name == 'workflow_dispatch'

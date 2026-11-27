@@ -70,24 +70,6 @@ def main() -> int:
     if to_remove:
         run(git + ["rm", "-q", "--"] + to_remove, repo)
 
-    # Regenerate the version list and CI matrix from upstream's versionProperties.
-    versions = sorted(
-        (p.stem for p in (repo / "versionProperties").glob("*.properties")),
-        key=lambda s: tuple(int(x) if x.isdigit() else x for x in re.split(r"[.]", s)),
-    )
-    if not versions:
-        print("ERROR: no versionProperties found after sync", file=sys.stderr)
-        return 1
-    wf = repo / ".github/workflows/build.yml"
-    text = wf.read_text(encoding="utf-8")
-    # Replace env MC_VERSIONS line
-    text = re.sub(r'^  MC_VERSIONS: ".*"$', '  MC_VERSIONS: "' + " ".join(versions) + '"',
-                  text, count=1, flags=re.M)
-    # Replace matrix block (between 'mc_ver:' and the following blank line)
-    block = "        mc_ver:\n" + "".join(f'          - "{v}"\n' for v in versions)
-    text = re.sub(r'^        mc_ver:\n(?:          - "[^"]+"\n)+', block, text, count=1, flags=re.M)
-    wf.write_text(text, encoding="utf-8", newline="")
-
     marker.write_text(upstream_head + "\n", encoding="utf-8")
 
     staged = run(git + ["status", "--porcelain"], repo).stdout.strip()
