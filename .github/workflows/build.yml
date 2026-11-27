@@ -1,0 +1,223 @@
+name: Build all Minecraft versions
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Single source of truth for the version list (space-separated).
+  MC_VERSIONS: "26.3.0 26.2.0 26.1.2 1.21.11 1.21.10 1.21.9 1.21.8 1.21.6 1.21.5 1.21.4 1.21.3 1.21.1 1.20.6 1.20.4 1.20.2 1.20.1 1.19.4 1.19.2 1.18.2 1.17.1 1.16.5 1.12.2 1.7.10"
+
+jobs:
+  build:
+    name: MC ${{ matrix.mc_ver }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Maven Central rate-limits (HTTP 429) when all 23 jobs fetch deps at once.
+      max-parallel: 3
+      matrix:
+        mc_ver:
+          - "26.3.0"
+          - "26.2.0"
+          - "26.1.2"
+          - "1.21.11"
+          - "1.21.10"
+          - "1.21.9"
+          - "1.21.8"
+          - "1.21.6"
+          - "1.21.5"
+          - "1.21.4"
+          - "1.21.3"
+          - "1.21.1"
+          - "1.20.6"
+          - "1.20.4"
+          - "1.20.2"
+          - "1.20.1"
+          - "1.19.4"
+          - "1.19.2"
+          - "1.18.2"
+          - "1.17.1"
+          - "1.16.5"
+          - "1.12.2"
+          - "1.7.10"
+
+    steps:
+      - name: Check MC version is in the authoritative list
+        run: |
+          echo "$MC_VERSIONS" | tr ' ' '\n' | grep -qx "${{ matrix.mc_ver }}" || {
+            echo "Matrix version ${{ matrix.mc_ver }} missing from MC_VERSIONS"; exit 1;
+          }
+
+      - name: Checkout (core is vendored, no submodules needed)
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 25 (Gradle daemon)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up legacy JDK 8 for 1.7.10 / 1.12.2 / 1.16.5
+        if: contains(fromJSON('["1.7.10","1.12.2","1.16.5"]'), matrix.mc_ver)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Minecraft ${{ matrix.mc_ver }}
+        run: |
+          # Maven Central rate-limits parallel CI jobs with HTTP 429.
+          # Retry only dependency-resolution failures, with a real cooldown.
+          delays=(45 120 240)
+          for attempt in 0 1 2 3; do
+            ./gradlew build -PmcVer="${{ matrix.mc_ver }}" --no-daemon --console=plain \
+              2>&1 | tee "build-${attempt}.log"
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -eq 0 ]; then exit 0; fi
+            if ! grep -qE 'HTTP 429|Too Many Requests|Could not (GET|resolve)' "build-${attempt}.log"; then
+              echo "Non-rate-limit failure - not retrying."
+              exit "$rc"
+            fi
+            if [ "$attempt" -eq 3 ]; then break; fi
+            delay=${delays[$attempt]}
+            echo "Rate-limited; retrying in ${delay}s (attempt $((attempt + 2)))..."
+            sleep "$delay"
+          done
+          echo "Build failed after 4 attempts"
+          exit 1
+
+      - name: Check unit tests and mixin resolution
+        run: |
+          # Upstream's core/API JUnit suite runs as part of `build`. Fail loudly if
+          # any test reported failures, or if remapping could not resolve a mixin.
+          for f in $(find . -path '*/build/test-results/test/*.xml' -type f); do
+            if grep -qE 'failures="[1-9]|errors="[1-9]' "$f"; then
+              echo "Unit test failure in $f"; grep -E '<testsuite' "$f" | head -2; exit 1
+            fi
+          done
+          test_count=$(find . -path '*/build/test-results/test/TEST-*.xml' -type f | wc -l)
+          if [ "$test_count" -eq 0 ]; then
+            echo "No JUnit results found for MC ${{ matrix.mc_ver }}"; exit 1
+          fi
+          echo "JUnit result files: $test_count"
+
+      - name: Collect jars
+        run: |
+          mkdir -p artifacts
+          # Prefix each jar with its subproject so identically named jars from
+          # different loaders can never overwrite one another.
+          # Only loader artifacts are usable mods. Skip common/core/buildSrc/API jars
+          # and dev/sources variants so the release contains installable jars only.
+          find . -name '*.jar' -type f -print0 |
+          while IFS= read -r -d '' jar; do
+            case "$jar" in
+              ./fabric/build/libs/*|./forge/build/libs/*|./forge17/build/libs/*|./forge112/build/libs/*|./neoforge/build/libs/*|./build/forgix/*) ;;
+              *) continue ;;
+            esac
+            case "$jar" in
+              *-sources.jar|*-dev.jar) continue ;;
+            esac
+            case "$jar" in
+              ./build/forgix/*) sub=merged ;;
+              *) sub=$(basename "$(dirname "$(dirname "$(dirname "$jar")")")") ;;
+            esac
+            cp "$jar" "artifacts/${sub}-$(basename "$jar")"
+          done
+          ls -lh artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DistantHorizons-${{ matrix.mc_ver }}
+          path: artifacts/*.jar
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Validate produced jars are loadable
+        run: python3 scripts/validate_jars.py --mc-ver "${{ matrix.mc_ver }}" --artifacts-dir artifacts
+
+  release:
+    name: Publish release with all jars
+    needs: build
+    if: needs.build.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-jars
+
+      - name: Flatten jars into one folder
+        run: |
+          echo "Build matrix result: ${{ needs.build.result }}"
+          mkdir -p final
+          find release-jars -name '*.jar' -type f -print0 |
+          while IFS= read -r -d '' jar; do
+            # filename already carries loader + MC version from the build job
+            cp "$jar" "final/$(basename "$jar")"
+          done
+          echo "Jars to publish: $(find final -name '*.jar' | wc -l)"
+          ls -lh final
+
+      - name: Verify every Minecraft version produced a jar
+        run: |
+          # Every matrix entry must appear in at least one released jar filename.
+          # Upstream abbreviates 26.x.y to 26.x in jar names, so match that too.
+          missing=0
+          for v in $MC_VERSIONS; do
+            token="$v"
+            case "$v" in 26.*.*) token=$(echo "$v" | cut -d. -f1,2) ;; esac
+            if ! find final -name "*.jar" -type f | grep -q -- "-${token}[.-]"; then
+              echo "MISSING jars for Minecraft $v"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Refusing to publish: $missing version(s) missing jars"
+            exit 1
+          fi
+          echo "Verified: all $MC_VERSIONS have jars"
+
+      - name: Remove stale nightly release assets
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete nightly --repo "${{ github.repository }}" --yes --cleanup-tag || true
+
+      - name: Create GitHub Release with every jar attached
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && 'nightly' || github.ref_name }}
+          name: ${{ github.event_name == 'workflow_dispatch' && 'Nightly - all Minecraft versions' || github.ref_name }}
+          body: |
+            Distant Horizons builds for every supported Minecraft version (1.7.10 - 26.3.0).
+
+            Pick the jar matching your Minecraft version and mod loader:
+            - `fabric-...` -> Fabric
+            - `forge-...`, `forge17-...`, `forge112-...` -> Forge
+            - `neoforge-...` -> NeoForge
+
+            Built automatically by GitHub Actions from UpdatedHorizons `main`.
+            Source: https://github.com/TheJoshCode/UpdatedHorizons
+          files: final/*.jar
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+

@@ -1,0 +1,569 @@
+/*
+ *    This file is part of the Distant Horizons mod
+ *    licensed under the GNU LGPL v3 License.
+ *
+ *    Copyright (C) 2020 James Seibel
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the GNU Lesser General Public License as published by
+ *    the Free Software Foundation, version 3.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Lesser General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Lesser General Public License
+ *    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.seibel.distanthorizons.core.render.renderer;
+
+import com.seibel.distanthorizons.api.enums.rendering.EDhApiTerrainRenderPass;
+import com.seibel.distanthorizons.api.enums.rendering.EDhApiTransparency;
+import com.seibel.distanthorizons.api.interfaces.render.IDhApiCustomRenderRegister;
+import com.seibel.distanthorizons.api.interfaces.render.IDhApiRenderableBoxGroup;
+import com.seibel.distanthorizons.api.interfaces.render.renderDef.*;
+import com.seibel.distanthorizons.api.interfaces.render.renderDef.objects.IDhApiGenericObjectVertexBufferContainer;
+import com.seibel.distanthorizons.api.methods.events.abstractEvents.*;
+import com.seibel.distanthorizons.api.methods.events.sharedParameterObjects.DhApiRenderParam;
+import com.seibel.distanthorizons.api.objects.render.DhApiRenderableBoxGroupShading;
+import com.seibel.distanthorizons.core.config.Config;
+import com.seibel.distanthorizons.core.dataObjects.render.bufferBuilding.LodBufferContainer;
+import com.seibel.distanthorizons.core.dependencyInjection.ModAccessorInjector;
+import com.seibel.distanthorizons.core.dependencyInjection.SingletonInjector;
+import com.seibel.distanthorizons.core.logging.DhLogger;
+import com.seibel.distanthorizons.core.logging.DhLoggerBuilder;
+import com.seibel.distanthorizons.core.pos.DhSectionPos;
+import com.seibel.distanthorizons.core.render.DhApiRenderProxy;
+import com.seibel.distanthorizons.core.render.DhBlockTextureAtlasUploadHandler;
+import com.seibel.distanthorizons.core.render.RenderBufferHandler;
+import com.seibel.distanthorizons.core.render.RenderParam;
+import com.seibel.distanthorizons.core.util.LodUtil;
+import com.seibel.distanthorizons.core.util.math.DhMat4f;
+import com.seibel.distanthorizons.core.util.math.DhVec3d;
+import com.seibel.distanthorizons.core.util.objects.SortedArraySet;
+import com.seibel.distanthorizons.core.wrapperInterfaces.minecraft.IMinecraftClientWrapper;
+import com.seibel.distanthorizons.core.wrapperInterfaces.minecraft.IProfilerWrapper;
+import com.seibel.distanthorizons.core.wrapperInterfaces.modAccessor.IIrisAccessor;
+import com.seibel.distanthorizons.coreapi.DependencyInjection.ApiEventInjector;
+
+import java.awt.*;
+import java.util.Collection;
+import java.util.HashMap;
+
+/**
+ * This is where all the magic happens. <br>
+ * This is where LODs are draw to the world.
+ */
+public class LodRenderer implements IDebugRenderable
+{
+	public static final DhLogger LOGGER = new DhLoggerBuilder()
+			.fileLevelConfig(Config.Common.Logging.logRendererEventToFile)
+			.build();
+	
+	public static final DhLogger RATE_LIMITED_LOGGER = new DhLoggerBuilder()
+			.fileLevelConfig(Config.Common.Logging.logRendererEventToFile)
+			.maxCountPerSecond(4)
+			.build();
+	
+	private static final IMinecraftClientWrapper MC = SingletonInjector.INSTANCE.get(IMinecraftClientWrapper.class);
+	private static final IIrisAccessor IRIS_ACCESSOR = ModAccessorInjector.INSTANCE.get(IIrisAccessor.class);
+	
+	public static final LodRenderer INSTANCE = new LodRenderer();
+	
+	private static final DhApiBeforeGenericObjectRenderEvent.EventParam GENERIC_OBJ_RENDER_EVENT_PARAM = new DhApiBeforeGenericObjectRenderEvent.EventParam();
+	
+	private static final HashMap<AbstractDhApiRenderDefinition, DhBlockTextureAtlasUploadHandler> TEXTURE_UPLOAD_HANDLER_BY_RENDER_DEF = new HashMap<>(); 
+	
+	
+	private boolean vanillaSettingsOverridden = false;
+	
+	
+	
+	//=============//
+	// constructor //
+	//=============//
+	//region
+	
+	private LodRenderer() { }
+	
+	//endregion
+	
+	
+	
+	//===========//
+	// rendering //
+	//===========//
+	//region
+	
+	/**
+	 * This will draw both opaque and transparent LODs if 
+	 * {@link DhApiRenderProxy#getDeferTransparentRendering()} is false,
+	 * otherwise it will only render opaque LODs.
+	 */
+	public void render(RenderParam renderParams, IProfilerWrapper profiler)
+	{  this.renderTerrain(renderParams, profiler, false);  }
+	
+	/**
+	 * This method is designed for Iris to be able 
+	 * to draw water in a deferred rendering context. 
+	 * It needs to be updated with any major changes, 
+	 * but shouldn't be activated as per deferWaterRendering.
+	 */
+	public void renderDeferred(RenderParam renderParams, IProfilerWrapper profiler)
+	{ this.renderTerrain(renderParams, profiler, true); }
+	
+	private void renderTerrain(RenderParam renderParams, IProfilerWrapper profiler, boolean runningDeferredPass)
+	{
+		//===============//
+		// validate pass //
+		//===============//
+		//region
+		
+		boolean deferTransparentRendering = DhApiRenderProxy.INSTANCE.getDeferTransparentRendering();
+		if (runningDeferredPass 
+			&& !deferTransparentRendering)
+		{
+			return;
+		}
+		boolean firstPass = !runningDeferredPass;
+		
+		// RenderParams parameter validation should be done before this
+		if (!renderParams.hasBeenValidated)
+		{
+			throw new IllegalArgumentException("Render parameters validation");
+		}
+		
+		//endregion
+		
+		
+		
+		//=================//
+		// rendering setup //
+		//=================//
+		//region
+		
+		ApiEventInjector.INSTANCE.fireAllEvents(DhApiBeforeRenderSetupEvent.class, renderParams.apiCopy);
+		try (IProfilerWrapper.IProfileBlock terrainRender_profile = profiler.push("LOD GL setup")) // starts the new profile block for most DH rendering
+		{
+			AbstractDhApiRenderDefinition renderDefinition = renderParams.renderDefinition;
+			IDhApiMetaRenderer metaRenderer = renderDefinition.getMetaRenderer();
+			IDhApiTerrainRenderer terrainRenderer = renderDefinition.getTerrainRenderer();
+			IDhApiSsaoRenderer ssaoRenderer = renderDefinition.getSsaoRenderer();
+			IDhApiFogRenderer fogRenderer = renderDefinition.getFogRenderer();
+			IDhApiFarFadeRenderer farFadeRenderer = renderDefinition.getFarFadeRenderer();
+			IDhApiAntiAliasRenderer antiAliasRenderer = renderDefinition.getAntiAliasRenderer();
+			IDhApiDebugWireframeRenderer debugWireframeRenderer = renderDefinition.getDebugWireframeRenderer();
+			IDhApiGenericRenderer genericRenderer = renderDefinition.getGenericRenderer();
+			
+			
+			RenderBufferHandler renderBufferHandler = renderParams.renderBufferHandler;
+			IDhApiCustomRenderRegister genericRegister = renderParams.clientLevelWrapper.getRenderRegister();
+			
+			
+			metaRenderer.runRenderPassSetup(renderParams);
+			
+			if (!this.vanillaSettingsOverridden)
+			{
+				// only do this once, that way they can still be reverted if desired
+				if (Config.Client.Advanced.Graphics.overrideVanillaGraphicsSettings.get())
+				{
+					LOGGER.info("Overriding vanilla MC settings to better fit Distant Horizons... This behavior can be disabled in the Distant Horizons config.");
+					
+					MC.disableVanillaClouds();
+					MC.disableVanillaChunkFadeIn();
+					MC.disableFabulousTransparency();
+				}
+				
+				this.vanillaSettingsOverridden = true;
+			}
+			
+			if (firstPass)
+			{
+				// we only need to sort/cull the LODs at the start of the frame
+				profiler.popPush("LOD build render list");
+				renderBufferHandler.buildRenderList(renderParams);
+			}
+			
+			
+			boolean renderFog;
+			Boolean apiFogOverride = Config.Client.Advanced.Graphics.Fog.enableDhFog.getApiValue();
+			if (apiFogOverride != null)
+			{
+				// use whatever the API dictates if set
+				// (this could cause issues when underwater if a shader or something
+				// doesn't add their own, but that's relatively unlikely)
+				renderFog = apiFogOverride;
+			}
+			else
+			{
+				renderFog = Config.Client.Advanced.Graphics.Fog.enableDhFog.get();
+				// allow enabling fog when: underwater fog, blind, etc.
+				// otherwise LODs won't appear correctly
+				renderFog |= renderParams.vanillaFogEnabled;
+			}
+			
+			DhApiBeforeFogRenderEvent.EventParam fogRenderEventParam = FogRenderParamFactory.getRenderParam(renderParams);
+			
+			//endregion
+			
+			
+			
+			//===========//
+			// rendering //
+			//===========//
+			
+			if (!runningDeferredPass)
+			{
+				// needs to be fired after all the textures have been created/bound
+				boolean clearTextures = !ApiEventInjector.INSTANCE.fireAllEvents(DhApiBeforeTextureClearEvent.class, renderParams.apiCopy);
+				if (clearTextures)
+				{
+					profiler.popPush("LOD Clear");
+					metaRenderer.clearDhDepthAndColorTextures(renderParams);
+				}
+				
+				
+				
+				//==================//
+				// texture handling //
+				//==================//
+				
+				// each render definition needs a separate render handler since each will have a
+				// different backend for the actual texture handling
+				DhBlockTextureAtlasUploadHandler textureUploadHandler = TEXTURE_UPLOAD_HANDLER_BY_RENDER_DEF.get(renderDefinition);
+				if (textureUploadHandler == null)
+				{
+					IDhApiBlockTextureAtlas textureAtlasWrapper = renderDefinition.getTextureAtlasWrapper();
+					textureUploadHandler = new DhBlockTextureAtlasUploadHandler(textureAtlasWrapper);
+					TEXTURE_UPLOAD_HANDLER_BY_RENDER_DEF.put(renderDefinition, textureUploadHandler);
+				}
+				
+				profiler.popPush("block texture upload");
+				textureUploadHandler.uploadPendingTiles();
+				
+				
+				
+				//=========================//
+				// opaque and non-deferred //
+				// transparent rendering   //
+				//=========================//
+				
+				// opaque LODs
+				profiler.popPush("LOD Opaque");
+				
+				this.renderTerrain(terrainRenderer, renderBufferHandler, renderParams, EDhApiTerrainRenderPass.OPAQUE);
+				
+				// called early when SSAO is off to avoid issues with pre 26.3 Iris
+				boolean ssaoEnabled = Config.Client.Advanced.Graphics.enableSsao.get();
+				if (!ssaoEnabled)
+				{
+					profiler.popPush("LOD Opaque Without SSAO");
+					this.renderTerrain(terrainRenderer, renderBufferHandler, renderParams, EDhApiTerrainRenderPass.OPAQUE_WITHOUT_SSAO);
+				}
+				
+				// custom objects with SSAO
+				if (Config.Client.Advanced.Graphics.GenericRendering.enableGenericRendering.get())
+				{
+					profiler.popPush("Custom Objects");
+					this.renderGenericObjects(renderParams, genericRegister, genericRenderer, true);
+				}
+				
+				// SSAO
+				if (ssaoEnabled)
+				{
+					profiler.popPush("LOD SSAO");
+					ssaoRenderer.render(renderParams);
+					
+					// this render pass is for things like tall grass, where vanilla MC
+					// draws them without SSAO to prevent them from getting too dark
+					profiler.popPush("LOD Opaque Without SSAO");
+					this.renderTerrain(terrainRenderer, renderBufferHandler, renderParams, EDhApiTerrainRenderPass.OPAQUE_WITHOUT_SSAO);
+				}
+				
+				// custom objects without SSAO
+				if (Config.Client.Advanced.Graphics.GenericRendering.enableGenericRendering.get())
+				{
+					profiler.popPush("Custom Objects");
+					this.renderGenericObjects(renderParams, genericRegister, genericRenderer, false);
+				}
+				
+				// combined pass transparent rendering
+				if (!deferTransparentRendering
+					&& Config.Client.Advanced.Graphics.Quality.transparency.get() == EDhApiTransparency.COMPLETE)
+				{
+					profiler.popPush("LOD Transparent");
+					this.renderTerrain(terrainRenderer, renderBufferHandler, renderParams, EDhApiTerrainRenderPass.TRANSPARENT);
+				}
+				
+				// fog
+				boolean cancelFogEvent = ApiEventInjector.INSTANCE.fireAllEvents(DhApiBeforeFogRenderEvent.class, fogRenderEventParam);
+				if (renderFog
+					&& !cancelFogEvent)
+				{
+					profiler.popPush("LOD Fog");
+					
+					fogRenderer.render(renderParams, fogRenderEventParam.getFogRenderParam());
+				}
+				
+				// far plane clip fading
+				if (IRIS_ACCESSOR == null
+					|| !IRIS_ACCESSOR.isShaderPackInUse())
+				{
+					// far fading would probably break shaders
+					// but is necessary for Anti-aliasing to apply to the sky/surrounding pixels properly
+					
+					profiler.popPush("Fade Far Clip Fade");
+					farFadeRenderer.render(renderParams);
+				}
+				
+				// Anti-Aliasing
+				if (Config.Client.Advanced.Graphics.enableAntiAliasing.get()
+					&&
+					(
+						// AA should be handled by the shader
+						IRIS_ACCESSOR == null
+						|| !IRIS_ACCESSOR.isShaderPackInUse()
+					)
+				)
+				{
+					profiler.popPush("Anti-Aliasing");
+					antiAliasRenderer.render(renderParams);
+				}
+				
+				
+				
+				//=================//
+				// debug rendering //
+				//=================//
+				
+				if (Config.Client.Advanced.Debugging.DebugWireframe.enableRendering.get())
+				{
+					profiler.popPush("Debug wireframes");
+					
+					// Note: this can be very slow if a lot of boxes are being rendered
+					DebugWireframeHandler.INSTANCE.render(renderParams, debugWireframeRenderer);
+				}
+				
+				
+				
+				//=========================//
+				// Apply to the MC Texture //
+				//=========================//
+				
+				boolean cancelApplyShader = ApiEventInjector.INSTANCE.fireAllEvents(DhApiBeforeApplyShaderRenderEvent.class, renderParams.apiCopy);
+				if (!cancelApplyShader)
+				{
+					profiler.popPush("Apply to MC");
+					metaRenderer.copyToMcTexture(renderParams);
+				}
+				
+			}
+			else
+			{
+				//====================//
+				// deferred rendering //
+				//====================//
+				
+				if (Config.Client.Advanced.Graphics.Quality.transparency.get() == EDhApiTransparency.COMPLETE)
+				{
+					profiler.popPush("LOD Transparent");
+					this.renderTerrain(terrainRenderer, renderBufferHandler, renderParams, EDhApiTerrainRenderPass.TRANSPARENT);
+					
+					
+					boolean cancelFogEvent = ApiEventInjector.INSTANCE.fireAllEvents(DhApiBeforeFogRenderEvent.class, fogRenderEventParam);
+					if (renderFog
+						&& !cancelFogEvent)
+					{
+						profiler.popPush("LOD Fog");
+						
+						fogRenderer.render(renderParams, fogRenderEventParam.getFogRenderParam());
+					}
+				}
+			}
+			
+			
+			
+			//================//
+			// render cleanup //
+			//================//
+			
+			profiler.popPush("LOD cleanup");
+			ApiEventInjector.INSTANCE.fireAllEvents(DhApiBeforeRenderCleanupEvent.class, renderParams.apiCopy);
+			
+			metaRenderer.runRenderPassCleanup(renderParams);
+		}
+	}
+	
+	//endregion
+	
+	
+	
+	//===================//
+	// terrain rendering //
+	//===================//
+	//region
+	
+	private void renderTerrain(IDhApiTerrainRenderer terrainRenderer, RenderBufferHandler lodBufferHandler, RenderParam renderEventParam, EDhApiTerrainRenderPass renderPass)
+	{
+		//===========//
+		// rendering //
+		//===========//
+		
+		SortedArraySet<LodBufferContainer> lodBufferContainer = lodBufferHandler.getColumnRenderBuffers(renderEventParam);
+		if (lodBufferContainer != null)
+		{
+			terrainRenderer.render(renderEventParam, renderPass, lodBufferContainer);
+		}
+	}
+	
+	//endregion
+	
+	
+	
+	//==========================//
+	// generic object rendering //
+	//==========================//
+	//region
+	
+	private void renderGenericObjects(
+		RenderParam renderEventParam,
+		IDhApiCustomRenderRegister renderRegister, IDhApiGenericRenderer genericRenderer,
+		boolean renderingWithSsao)
+	{
+		IProfilerWrapper profiler = renderEventParam.profiler;
+		
+		try (IProfilerWrapper.IProfileBlock generic_profile = profiler.push("setup"))
+		{
+			//==============//
+			// render setup //
+			//==============//
+			//#region
+			
+			ApiEventInjector.INSTANCE.fireAllEvents(DhApiBeforeGenericRenderSetupEvent.class, renderEventParam.apiCopy);
+			
+			//#endregion
+			
+			
+			
+			//===========//
+			// rendering //
+			//===========//
+			//#region
+			
+			Collection<? extends IDhApiRenderableBoxGroup> boxList = renderRegister.getRenderBoxList();
+			for (IDhApiRenderableBoxGroup apiBoxGroup : boxList)
+			{
+				RenderableBoxGroup boxGroup = (RenderableBoxGroup)apiBoxGroup;
+				
+				
+				// validation //
+				
+				// shouldn't happen, but just in case
+				if (boxGroup == null)
+				{
+					continue;
+				}
+				
+				// skip boxes that shouldn't render this pass
+				if (boxGroup.ssaoEnabled != renderingWithSsao)
+				{
+					continue;
+				}
+				
+				profiler.popPush("render prep");
+				boxGroup.preRender(renderEventParam); // called even if the group is inactive, so the group can be activate if desired
+				
+				// ignore inactive groups
+				if (!boxGroup.active)
+				{
+					continue;
+				}
+				
+				// allow API users to cancel this object's rendering
+				GENERIC_OBJ_RENDER_EVENT_PARAM.update(renderEventParam, boxGroup);
+				boolean cancelRendering = ApiEventInjector.INSTANCE.fireAllEvents(DhApiBeforeGenericObjectRenderEvent.class, GENERIC_OBJ_RENDER_EVENT_PARAM);
+				GENERIC_OBJ_RENDER_EVENT_PARAM.clearLevelReferences();
+				
+				if (cancelRendering)
+				{
+					continue;
+				}
+				
+				// update instanced data if needed
+				{
+					boxGroup.tryUpdateInstancedDataAsync(renderEventParam);
+					
+					// skip groups that haven't been uploaded yet
+					if (boxGroup.getRenderVertexBufferContainer().getState() != IDhApiGenericObjectVertexBufferContainer.EState.RENDER)
+					{
+						continue;
+					}
+				}
+				
+				
+				
+				// render //
+				
+				genericRenderer.preRender(renderEventParam);
+				
+				profiler.popPush("rendering");
+				try (IProfilerWrapper.IProfileBlock namespace_profile = profiler.push(boxGroup.getResourceLocationNamespace());
+					IProfilerWrapper.IProfileBlock location_profile = profiler.push(boxGroup.getResourceLocationPath()))
+				{
+					genericRenderer.render(renderEventParam, boxGroup);
+				}
+				
+				genericRenderer.postRender(renderEventParam);
+			}
+			
+			//#endregion
+			
+			
+			
+			//==========//
+			// clean up //
+			//==========//
+			//region
+			
+			profiler.popPush("cleanup");
+			ApiEventInjector.INSTANCE.fireAllEvents(DhApiBeforeGenericRenderCleanupEvent.class, renderEventParam);
+			
+			//endregion
+		}
+	}
+	
+	//endregion
+	
+	
+	
+	//===========//
+	// debugging //
+	//===========//
+	//region
+	
+	@Override
+	public void debugRender(IDhApiDebugWireframeRenderer renderer)
+	{
+		if (Config.Client.Advanced.Debugging.PositionFinder.positionFinderEnable.get())
+		{
+			// can be used to find specific positions when debugging
+			renderer.renderBox(new DebugWireframeHandler.Box(
+				DhSectionPos.encode(
+					Config.Client.Advanced.Debugging.PositionFinder.positionFinderDetailLevel.get().byteValue(),
+					Config.Client.Advanced.Debugging.PositionFinder.positionFinderXPos.get(),
+					Config.Client.Advanced.Debugging.PositionFinder.positionFinderZPos.get()),
+				Config.Client.Advanced.Debugging.PositionFinder.positionFinderMinBlockY.get(),
+				Config.Client.Advanced.Debugging.PositionFinder.positionFinderMaxBlockY.get(),
+				Config.Client.Advanced.Debugging.PositionFinder.positionFinderMarginPercent.get(),
+				Color.GREEN
+			));
+		}
+	}
+	
+	//endregion
+	
+	
+	
+}

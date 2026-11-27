@@ -1,0 +1,367 @@
+/*
+ *    This file is part of the Distant Horizons mod
+ *    licensed under the GNU LGPL v3 License.
+ *
+ *    Copyright (C) 2020 James Seibel
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the GNU Lesser General Public License as published by
+ *    the Free Software Foundation, version 3.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Lesser General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Lesser General Public License
+ *    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.seibel.distanthorizons.api.interfaces.render;
+
+import com.seibel.distanthorizons.api.enums.config.EDhApiDepthRange;
+import com.seibel.distanthorizons.api.enums.config.EDhApiDepthDirection;
+import com.seibel.distanthorizons.api.enums.config.EDhApiRenderingApi;
+import com.seibel.distanthorizons.api.enums.config.EDhApiRenderingEngine;
+import com.seibel.distanthorizons.api.interfaces.config.IDhApiConfigValue;
+import com.seibel.distanthorizons.api.interfaces.render.renderDef.AbstractDhApiRenderDefinition;
+import com.seibel.distanthorizons.api.interfaces.world.IDhApiLevelWrapper;
+import com.seibel.distanthorizons.api.interfaces.world.IDhApiWorldProxy;
+import com.seibel.distanthorizons.api.methods.events.abstractEvents.DhApiAfterDhInitEvent;
+import com.seibel.distanthorizons.api.objects.DhApiResult;
+import com.seibel.distanthorizons.api.objects.math.DhApiMat4f;
+
+import java.util.concurrent.CompletableFuture;
+
+
+/**
+ * Used to interact with Distant Horizons' rendering system.
+ *
+ * @author James Seibel
+ * @version 2026-11-01
+ * @since API 1.0.0
+ */
+public interface IDhApiRenderProxy
+{
+	//==============//
+	// render cache //
+	//==============//
+	//region
+	
+	/**
+	 * Forces any cached render data to be deleted and regenerated.
+	 * This is generally called whenever resource packs are changed or specific
+	 * rendering settings are changed in Distant Horizon's config. <Br><Br>
+	 *
+	 * If this is called on a dedicated server it won't do anything and will return {@link DhApiResult#success} = false <Br><Br>
+	 *
+	 * Background: <Br>
+	 * When rendering Distant Horizons bakes each block's color into the geometry that's rendered. <Br>
+	 * This improves rendering speed and VRAM size, but prevents dynamically changing LOD colors. <Br>
+	 *     
+	 * @see #reloadRenderDataCache()
+	 */
+	DhApiResult<Boolean> clearRenderDataCache();
+	
+	/**
+	 * Similar to {@link #clearRenderDataCache()} except it doesn't
+	 * delete any currently rendering data. Any currently-rendering data will be replaced
+	 * once the new data has been loaded. <br><br> 
+	 * 
+	 * This allows for less distracting changes vs {@link #clearRenderDataCache()}
+	 * if, for example, you only want to change color/biome data while
+	 * keeping the same {@link EDhApiRenderingEngine}.
+	 * 
+	 * @see #clearRenderDataCache()
+	 * 
+	 * @since API 7.3.0
+	 */
+	DhApiResult<Boolean> reloadRenderDataCache();
+	
+	//endregion
+	
+	
+	
+	//=========//
+	// getters //
+	//=========//
+	//region
+	
+	/**
+	 * Returns which specific {@link EDhApiRenderingApi}
+	 * Distant Horizons will use for rendering. <br><br>
+	 * 
+	 * @throws IllegalStateException if no renderer has been bound yet, 
+	 *      wait till after {@link DhApiAfterDhInitEvent} has been fired
+	 * 
+	 * @see DhApiAfterDhInitEvent
+	 * @since API 7.0.0
+	 */
+	EDhApiRenderingApi getRenderingApi() throws IllegalStateException;
+	/**
+	 * Returns which specific {@link EDhApiRenderingEngine}
+	 * Distant Horizons will use for rendering. <br><br>
+	 * 
+	 * @throws IllegalStateException if no renderer has been bound yet, 
+	 *      wait till after {@link DhApiAfterDhInitEvent} has been fired
+	 * 
+	 * @see DhApiAfterDhInitEvent
+	 * @since API 7.1.0
+	 */
+	EDhApiRenderingEngine getRenderingEngine() throws IllegalStateException;
+	/**
+	 * Returns true if the current renderer
+	 * is calling the base rendering API's method calls. <br>
+	 * ie GL.drawArrays() for OpenGL. <Br><br>
+	 *
+	 * If DH is using a rendering interpretation layer like Blaze3D (Mojang's rendering API) 
+	 * this will return false.
+	 *
+	 * @throws IllegalStateException if no renderer has been bound yet, 
+	 *      wait till after {@link DhApiAfterDhInitEvent} has been fired
+	 *
+	 * @see DhApiAfterDhInitEvent
+	 * @since API 7.0.0
+	 */
+	boolean isNativeRenderer() throws IllegalStateException;
+	
+	/**
+	 * Returns the currently active {@link EDhApiDepthRange} DH is rendering with this frame. <Br>
+	 * This value may change from frame to frame based on config and other active mods.
+	 *
+	 * @throws IllegalStateException if no renderer has been bound yet, 
+	 *      wait till after {@link DhApiAfterDhInitEvent} has been fired
+	 *
+	 * @since API 7.2.0
+	 */
+	EDhApiDepthRange getDepthRange() throws IllegalStateException;
+	/**
+	 * Returns the currently active {@link EDhApiDepthDirection} DH is rendering with this frame. <Br>
+	 * This value may change from frame to frame based on config and other active mods.
+	 *
+	 * @throws IllegalStateException if no renderer has been bound yet, 
+	 *      wait till after {@link DhApiAfterDhInitEvent} has been fired
+	 *
+	 * @since API 7.2.0
+	 */
+	EDhApiDepthDirection getDepthDirection() throws IllegalStateException;
+	
+	//endregion
+	
+	
+	
+	//============//
+	// render def //
+	//============//
+	//region
+	
+	/**
+	 * Sets a new {@link AbstractDhApiRenderDefinition} to override
+	 * DH's base renderer. <br><Br>
+	 * 
+	 * Will run at the beginning of DH's next frame.
+	 * 
+	 * @param apiUserDisplayName is displayed in the UI to denote your control over the rendering definition
+	 *                           so users can easily see what your mod is controlling. 
+	 *                           Identical to {@link IDhApiConfigValue#setValue(Object, String)}
+	 */
+	CompletableFuture<DhApiResult<String>> setRenderDefinitionOverrideAsync(AbstractDhApiRenderDefinition renderDef, String apiUserDisplayName);
+	/** 
+	 * Unbinds the currently active API set {@link AbstractDhApiRenderDefinition}
+	 * if one is present and replaces it with DH's base renderer. <br><br>
+	 * 
+	 * If no override {@link AbstractDhApiRenderDefinition} is set,
+	 * this will just refresh DH's own renderer. <br><Br>
+	 * 
+	 * Will run at the beginning of DH's next frame.
+	 */
+	CompletableFuture<DhApiResult<String>> clearRenderDefinitionOverrideAsync();
+	
+	//endregion
+	
+	
+	
+	//=================//
+	// texture getters //
+	//=================//
+	//region
+	
+	/** @deprecated in favor of {@link IDhApiRenderProxy#getDhDepthTextureGlId} */
+	@Deprecated // don't remove, this method is needed by Iris
+	default DhApiResult<Integer> getDhDepthTextureId() { return this.getDhDepthTextureGlId(); }
+	/**
+	 * Returns the OpenGL name of Distant Horizons' depth texture. <br>
+	 * Will return {@link DhApiResult#success} = false and {@link DhApiResult#payload} = -1 if the texture hasn't been created yet
+	 * or a rendering API other than {@link EDhApiRenderingEngine#OPEN_GL} is in use.
+	 *
+	 * @see IDhApiRenderProxy#getRenderingEngine()
+	 * @since API 7.1.0
+	 */
+	DhApiResult<Integer> getDhDepthTextureGlId();
+	/**
+	 * Returns a wrapper around the Blaze3D objects that represent Distant Horizons' depth texture. <br>
+	 * Will return {@link DhApiResult#success} = false and {@link DhApiResult#payload} = null if the texture hasn't been created yet
+	 * or a rendering API other than {@link EDhApiRenderingEngine#BLAZE_3D} is in use.
+	 *
+	 * @see IDhApiRenderProxy#getRenderingEngine()
+	 * @since API 7.1.0
+	 */
+	DhApiResult<IDhApiBlazeTextureWrapper> getDhDepthTextureBlazeWrapper();
+	
+	
+	/** @deprecated in favor of {@link IDhApiRenderProxy#getDhDepthTextureGlId} */
+	@Deprecated // don't remove, this method is needed by Iris
+	default DhApiResult<Integer> getDhColorTextureId() { return this.getDhColorTextureGlId(); }
+	/**
+	 * Returns the OpenGL name of Distant Horizons' color texture. <br>
+	 * Will return {@link DhApiResult#success} = false and {@link DhApiResult#payload} = -1 if the texture hasn't been created yet
+	 * or a rendering API other than {@link EDhApiRenderingEngine#OPEN_GL} is in use.
+	 *
+	 * @see IDhApiRenderProxy#getRenderingEngine()
+	 * @since API 7.1.0
+	 */
+	DhApiResult<Integer> getDhColorTextureGlId();
+	/**
+	 * Returns a wrapper around the Blaze3D objects that represent Distant Horizons' color texture. <br>
+	 * Will return {@link DhApiResult#success} = false and {@link DhApiResult#payload} = null if the texture hasn't been created yet
+	 * or a rendering API other than {@link EDhApiRenderingEngine#BLAZE_3D} is in use.
+	 *
+	 * @see IDhApiRenderProxy#getRenderingEngine() 
+	 * @since API 7.1.0
+	 */
+	DhApiResult<IDhApiBlazeTextureWrapper> getDhColorTextureBlazeWrapper();
+	
+	/**
+	 * Returns the OpenGL name of Distant Horizons' block ratio atlas texture. <br>
+	 * Will return {@link DhApiResult#success} = false and {@link DhApiResult#payload} = -1 if the texture hasn't been created yet
+	 * or a rendering API other than {@link EDhApiRenderingEngine#OPEN_GL} is in use. <br><br>
+	 *  
+	 * The term "block ratio atlas" means the texture is a ratio between DH's underlying color
+	 * and the color the block should have for that face. <br>
+	 * A color value of 0.5f (or half a byte) means DH's base color will be used for that pixel. <br><br>
+	 *  
+	 * <b>Note:</b> <br>
+	 * This texture is likely to be recreated/changed without warning.
+	 * If you want to use this texture at render-time it's recommended you
+	 * query this method every time before binding.
+	 * 
+	 * @see IDhApiRenderProxy#getRenderingEngine()
+	 * @since API 7.1.0
+	 */
+	DhApiResult<Integer> getDhBlockRatioAtlasTextureGlId();
+	/**
+	 * Returns a wrapper around the Blaze3D objects that represent Distant Horizons' block ratio atlas texture. <br>
+	 * Will return {@link DhApiResult#success} = false and {@link DhApiResult#payload} = null if the texture hasn't been created yet
+	 * or a rendering API other than {@link EDhApiRenderingEngine#BLAZE_3D} is in use. <br><br>
+	 * 
+	 * The term "block ratio atlas" means the texture is a ratio between DH's underlying color
+	 * and the color the block should have for that face. <br>
+	 * A color value of 0.5f (or half a byte) means DH's base color will be used for that pixel. <br><br>
+	 *
+	 * <b>Note:</b> <br>
+	 * This texture is likely to be recreated/changed without warning.
+	 * If you want to use this texture at render-time it's recommended you
+	 * query this method every time before binding.
+	 *
+	 * @see IDhApiRenderProxy#getRenderingEngine()
+	 * @since API 7.1.0
+	 */
+	DhApiResult<IDhApiBlazeTextureWrapper> getDhBlockRatioAtlasTextureBlazeWrapper();
+	
+	//endregion
+	
+	
+	
+	//======================//
+	// Shader compatibility //
+	//======================//
+	//region
+	
+	/**
+	 * If set to true DH won't render opaque and transparent LODs in the same pass.
+	 * Instead, opaque objects will be rendered at the normal time, but 
+	 * transparent objects will only be rendered in a second pass during Minecraft's
+	 * own transparent rendering pass.
+	 */
+	void setDeferTransparentRendering(boolean deferTransparentRendering);
+	/** @return If DH should defer transparent rendering or not. */
+	boolean getDeferTransparentRendering();
+	
+	/** This may change based on FOV, player speed, and other factors. */
+	float getNearClipPlaneDistanceInBlocks(float partialTicks);
+	
+	//endregion
+	
+	
+	
+	//=======================//
+	// Manual Render Trigger //
+	//=======================//
+	//region
+	
+	/**
+	 * If set to true DH will attempt to render automatically using its own
+	 * injection/mixin/event points.
+	 * If set to false DH will not render unless it is manually triggered via {@link #renderLodPass}. <br><br>
+	 * 
+	 * Designed to be used alongside {@link #renderLodPass} and {@link #renderVanillaFadePass}
+	 * to allow for custom DH render handling, although it doesn't have to be set if you want to add additional
+	 * render passes outside of DH's base render injection points.
+	 * 
+	 * @since API 7.3.0
+	 */
+	void setUseDhRenderInjections(boolean useDhRenderInjections);
+	/**
+	 * @see #setUseDhRenderInjections(boolean) 
+	 * @since API 7.3.0
+	 */
+	boolean getUseDhRenderInjections();
+	
+	/**
+	 * Triggers a DH render pass. <Br>
+	 * This includes all DH terrain, generic objects (clouds, beacons, etc.), and post-processing on said DH rendering.
+	 * 
+	 * @param minecraftModelViewMatrix Minecraft's Model View matrix used for this frame/render pass
+	 * @param minecraftProjectionMatrix Minecraft's Projection matrix used for this frame/render pass
+	 * @param partialTickTime the current partial ticks for this frame/render pass
+	 * @param clientLevelWrapper the level DH is going to render, 
+	 *                           recommended to be used alongside {@link IDhApiWorldProxy#getSinglePlayerLevel}
+	 * @param deferredLayer if DH is set to render deferred this controls whether the current pass is the opaque/combined pass or just the transparent/deferred pass
+	 *
+	 * @exception RuntimeException if any of the provided arguments are invalid
+	 * 
+	 * @since API 7.3.0
+	 */
+	void renderLodPass(
+		DhApiMat4f minecraftModelViewMatrix, DhApiMat4f minecraftProjectionMatrix,
+		float partialTickTime,
+		IDhApiLevelWrapper clientLevelWrapper,
+		boolean deferredLayer
+	) throws RuntimeException;
+	
+	/**
+	 * Triggers DH's vanilla fade render pass (the fading between the DH and vanilla rendering).
+	 * 
+	 * @param minecraftModelViewMatrix Minecraft's Model View matrix used for this frame/render pass
+	 * @param minecraftProjectionMatrix Minecraft's Projection matrix used for this frame/render pass
+	 * @param partialTickTime the current partial ticks for this frame/render pass
+	 * @param clientLevelWrapper the level DH is going to render,
+	 *                          recommended to be used alongside {@link IDhApiWorldProxy#getSinglePlayerLevel}
+	 * @param transparentPass if true this 
+	 * 
+	 * @exception RuntimeException if any of the provided arguments are invalid
+	 * 
+	 * @since API 7.3.0
+	 */
+	void renderVanillaFadePass(
+		DhApiMat4f minecraftModelViewMatrix, DhApiMat4f minecraftProjectionMatrix,
+		float partialTickTime,
+		IDhApiLevelWrapper clientLevelWrapper,
+		boolean transparentPass
+	) throws RuntimeException;
+	
+	//endregion
+	
+	
+	
+}
