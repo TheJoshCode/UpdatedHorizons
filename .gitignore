@@ -48,6 +48,3 @@ build.properties
 
 # Don't add access transformers to git as they're dynamically generated
 accesstransformer.cfg
-
-# Local JDK install for building on this host
-jdk25/
