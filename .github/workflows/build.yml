@@ -42,14 +42,14 @@ jobs:
         mc_ver: ${{ fromJSON(needs.matrix.outputs.versions) }}
 
     steps:
+      - name: Checkout (core is vendored, no submodules needed)
+        uses: actions/checkout@v4
+
       - name: Check MC version is in the authoritative list
         run: |
           find versionProperties -name '${{ matrix.mc_ver }}.properties' | grep -q . || {
             echo "Matrix version ${{ matrix.mc_ver }} missing from MC_VERSIONS"; exit 1;
           }
-
-      - name: Checkout (core is vendored, no submodules needed)
-        uses: actions/checkout@v4
 
       - name: Set up JDK 25 (Gradle daemon)
         uses: actions/setup-java@v4
